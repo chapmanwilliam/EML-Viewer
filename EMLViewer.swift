@@ -34,12 +34,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             try task.run()
-            task.waitUntilExit()
         } catch {
             return
         }
 
+        // Read pipe to EOF before waitUntilExit: stdout >16KB will block the
+        // child if no one drains it, deadlocking against waitUntilExit.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
         guard let html = String(data: data, encoding: .utf8), !html.isEmpty else { return }
 
         // Extract title from HTML
