@@ -3,8 +3,12 @@
 
 import email
 import email.policy
+import hashlib
 import os
+import re
 import sys
+import tempfile
+import urllib.parse
 import html as html_mod
 
 try:
@@ -19,6 +23,41 @@ try:
     HAS_WEBKIT = True
 except ImportError:
     HAS_WEBKIT = False
+
+
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._ +()-]")
+
+
+def attachment_dir(eml_path):
+    """Stable scratch dir per message, so reopening the same file reuses extractions."""
+    st = os.stat(eml_path)
+    key = "%s|%s|%s" % (os.path.abspath(eml_path), st.st_mtime_ns, st.st_size)
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(tempfile.gettempdir(), "eml-viewer", digest)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def safe_name(filename, index, taken):
+    """Strip anything that could escape the scratch dir, and de-duplicate."""
+    name = _UNSAFE_NAME.sub("_", os.path.basename(filename or "").strip())
+    if not name or name.startswith("."):
+        name = "attachment-%d" % index
+    stem, ext = os.path.splitext(name)
+    candidate, n = name, 2
+    while candidate in taken:
+        candidate = "%s-%d%s" % (stem, n, ext)
+        n += 1
+    taken.add(candidate)
+    return candidate
+
+
+def human_size(n):
+    if n < 1024:
+        return "%d bytes" % n
+    if n < 1024 * 1024:
+        return "%.0f KB" % (n / 1024)
+    return "%.1f MB" % (n / (1024 * 1024))
 
 
 def parse_eml(eml_path):
@@ -40,9 +79,8 @@ def parse_eml(eml_path):
             content_type = part.get_content_type()
             disposition = str(part.get("Content-Disposition", ""))
             if "attachment" in disposition:
-                filename = part.get_filename() or "attachment"
-                size = len(part.get_payload(decode=True) or b"")
-                attachments.append((filename, content_type, size))
+                payload = part.get_payload(decode=True) or b""
+                attachments.append((part.get_filename(), content_type, payload))
             elif content_type == "text/html" and html_body is None:
                 html_body = part.get_content()
             elif content_type == "text/plain" and text_body is None:
@@ -64,10 +102,27 @@ def parse_eml(eml_path):
 
     attachments_html = ""
     if attachments:
-        items = "".join(
-            f"<li>{html_mod.escape(name)} <span style='color:#999;'>({ctype}, {size//1024}KB)</span></li>"
-            for name, ctype, size in attachments
-        )
+        # Write each attachment out so the HTML can link to it; the Swift wrapper
+        # intercepts the click and hands the file to Launch Services.
+        out_dir = attachment_dir(eml_path)
+        taken = set()
+        parts = []
+        for index, (filename, ctype, payload) in enumerate(attachments, 1):
+            name = safe_name(filename, index, taken)
+            dest = os.path.join(out_dir, name)
+            if not os.path.exists(dest) or os.path.getsize(dest) != len(payload):
+                with open(dest, "wb") as fh:
+                    fh.write(payload)
+            # Custom scheme, not file://: WebKit silently blocks file:// links
+            # from an about:blank origin without ever consulting the
+            # navigation delegate. The Swift wrapper unpacks this back to a path.
+            href = "eml-attachment://" + urllib.parse.quote(dest)
+            label = html_mod.escape(filename or name)
+            parts.append(
+                f"<li><a class='attachment' href='{html_mod.escape(href, quote=True)}'>{label}</a>"
+                f" <span style='color:#999;'>({ctype}, {human_size(len(payload))})</span></li>"
+            )
+        items = "".join(parts)
         attachments_html = f"""
         <div style="margin-top:16px;padding:12px;background:#f8f8f8;border-radius:6px;">
             <strong>Attachments ({len(attachments)})</strong>
@@ -87,6 +142,8 @@ def parse_eml(eml_path):
     .meta {{ font-size: 12px; color: #555; line-height: 1.6; }}
     .meta strong {{ color: #333; }}
     .body {{ padding: 20px; font-size: 14px; line-height: 1.5; }}
+    a.attachment {{ color: #0066cc; text-decoration: none; }}
+    a.attachment:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
@@ -143,7 +200,6 @@ def show_native(eml_path):
 
 
 def show_browser(eml_path):
-    import tempfile
     import webbrowser
     _, html = parse_eml(eml_path)
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
