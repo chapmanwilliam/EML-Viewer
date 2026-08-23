@@ -4,12 +4,15 @@
 import email
 import email.policy
 import hashlib
+import json
 import os
 import re
 import sys
 import tempfile
 import urllib.parse
 import html as html_mod
+
+from chain import split_chain_html, split_chain_text
 
 try:
     import objc
@@ -60,7 +63,12 @@ def human_size(n):
     return "%.1f MB" % (n / (1024 * 1024))
 
 
-def parse_eml(eml_path):
+def _js_string(value):
+    """JSON-encode for safe interpolation into a <script> block."""
+    return json.dumps(value).replace("</", "<\\/")
+
+
+def parse_eml(eml_path, anchor=None):
     with open(eml_path, "rb") as f:
         msg = email.message_from_binary_file(f, policy=email.policy.default)
 
@@ -92,11 +100,26 @@ def parse_eml(eml_path):
         else:
             text_body = msg.get_content()
 
+    # Split the chain so each quoted message is separately addressable. A link
+    # into a chronology usually means one message in the pile, not the file.
+    segments = []
     body_html = ""
     if html_body:
-        body_html = html_body
+        body_html, segments = split_chain_html(html_body)
     elif text_body:
-        body_html = "<pre style='white-space:pre-wrap;font-family:inherit;'>" + html_mod.escape(text_body) + "</pre>"
+        chunks = split_chain_text(text_body)
+        if chunks:
+            pieces = []
+            for meta, chunk in chunks:
+                pieces.append(
+                    "<div class='eml-msg' id='msg-%d' data-key='%s'>"
+                    "<pre style='white-space:pre-wrap;font-family:inherit;'>%s</pre></div>"
+                    % (meta["index"], meta["key"], html_mod.escape(chunk))
+                )
+            body_html = "".join(pieces)
+            segments = [m for m, _ in chunks]
+        else:
+            body_html = "<pre style='white-space:pre-wrap;font-family:inherit;'>" + html_mod.escape(text_body) + "</pre>"
     else:
         body_html = "<p style='color:#999;'>No displayable content</p>"
 
@@ -131,6 +154,41 @@ def parse_eml(eml_path):
 
     cc_line = f'<div style="margin-bottom:4px;"><strong>Cc:</strong> {html_mod.escape(cc_addr)}</div>' if cc_addr else ""
 
+    # A chain of 20 messages is hard to navigate and harder to cite. List them,
+    # newest first, and let a click flash the one you want.
+    chain_html = ""
+    if len(segments) > 1:
+        rows = []
+        for seg in segments:
+            if seg["index"] == 0:
+                who, when = "This message", ""
+            else:
+                who = seg["from"] or "(sender not identified)"
+                when = seg["sent"]
+            rows.append(
+                "<li><a href='#' onclick=\"return emlHighlight('{key}')\">"
+                "<span class='who'>{who}</span>"
+                "<span class='when'>{when}</span></a></li>".format(
+                    key=seg["key"],
+                    who=html_mod.escape(who),
+                    when=html_mod.escape(when),
+                )
+            )
+        chain_html = (
+            "<details class='chain'><summary>{n} messages in this chain</summary>"
+            "<ol class='chain-list'>{rows}</ol></details>".format(
+                n=len(segments), rows="".join(rows)
+            )
+        )
+
+    # Injected only when a link asked for a specific message.
+    anchor_js = ""
+    if anchor:
+        anchor_js = (
+            "<script>window.addEventListener('load',function(){{"
+            "emlHighlight({a});}});</script>".format(a=_js_string(anchor))
+        )
+
     page = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -144,6 +202,30 @@ def parse_eml(eml_path):
     .body {{ padding: 20px; font-size: 14px; line-height: 1.5; }}
     a.attachment {{ color: #0066cc; text-decoration: none; }}
     a.attachment:hover {{ text-decoration: underline; }}
+
+    /* Chain navigator */
+    .chain {{ margin-top: 12px; font-size: 12px; }}
+    .chain summary {{ cursor: pointer; color: #555; user-select: none; }}
+    .chain-list {{ margin: 8px 0 0 0; padding-left: 22px; color: #444; }}
+    .chain-list li {{ margin: 3px 0; }}
+    .chain-list a {{ color: #0066cc; text-decoration: none; display: flex; gap: 10px; }}
+    .chain-list a:hover {{ text-decoration: underline; }}
+    .chain-list .who {{ flex: 1 1 auto; }}
+    .chain-list .when {{ flex: 0 0 auto; color: #999; }}
+
+    /* A cited message is flashed, not permanently marked: three pulses, then a
+       tint that fades. Anything sticky would look like the user's own highlight. */
+    .eml-msg {{ scroll-margin-top: 14px; border-radius: 4px; }}
+    @keyframes eml-flash {{
+        0%, 100% {{ background-color: transparent; }}
+        12%, 42%, 72% {{ background-color: rgba(255, 221, 51, 0.62); }}
+        27%, 57%, 87% {{ background-color: transparent; }}
+    }}
+    .eml-msg.eml-flash {{ animation: eml-flash 1.8s ease-in-out 1; }}
+    .eml-msg.eml-linger {{ background-color: rgba(255, 221, 51, 0.14); transition: background-color 2.5s ease; }}
+    @media (prefers-reduced-motion: reduce) {{
+        .eml-msg.eml-flash {{ animation: none; background-color: rgba(255, 221, 51, 0.45); }}
+    }}
 </style>
 </head>
 <body>
@@ -156,16 +238,35 @@ def parse_eml(eml_path):
             <div><strong>Date:</strong> {html_mod.escape(date)}</div>
         </div>
         {attachments_html}
+        {chain_html}
     </div>
     <div class="body">{body_html}</div>
+<script>
+function emlHighlight(key) {{
+    var el = document.querySelector('[data-key="' + key + '"]')
+          || document.getElementById('msg-' + key);
+    if (!el) {{ return false; }}
+    el.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+    el.classList.remove('eml-flash', 'eml-linger');
+    void el.offsetWidth;                 // restart the animation if re-clicked
+    el.classList.add('eml-flash');
+    setTimeout(function () {{
+        el.classList.remove('eml-flash');
+        el.classList.add('eml-linger');
+        setTimeout(function () {{ el.classList.remove('eml-linger'); }}, 2500);
+    }}, 1800);
+    return false;
+}}
+</script>
+{anchor_js}
 </body>
 </html>"""
 
-    return subject, page
+    return subject, page, segments
 
 
-def show_native(eml_path):
-    subject, html = parse_eml(eml_path)
+def show_native(eml_path, anchor=None):
+    subject, html, _ = parse_eml(eml_path, anchor)
 
     app = NSApplication.sharedApplication()
 
@@ -199,16 +300,37 @@ def show_native(eml_path):
     app.run()
 
 
-def show_browser(eml_path):
+def show_browser(eml_path, anchor=None):
     import webbrowser
-    _, html = parse_eml(eml_path)
+    _, html, _ = parse_eml(eml_path, anchor)
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
         f.write(html)
         tmp_path = f.name
     webbrowser.open("file://" + tmp_path)
 
 
+def chain_of(eml_path):
+    """The chain of an .eml as a list of segment dicts, newest first."""
+    return parse_eml(eml_path)[2]
+
+
+def _take_anchor():
+    """Pull --anchor KEY (or --anchor=KEY) out of argv. Returns the key or None."""
+    for i, arg in enumerate(list(sys.argv)):
+        if arg == "--anchor" and i + 1 < len(sys.argv):
+            key = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+            return key
+        if arg.startswith("--anchor="):
+            del sys.argv[i]
+            return arg.split("=", 1)[1]
+    return None
+
+
 def main():
+    # --anchor KEY scrolls to one message of the chain and flashes it.
+    anchor = _take_anchor()
+
     # Handle --html-only flag: output HTML to stdout (used by Swift wrapper)
     if "--html-only" in sys.argv:
         sys.argv.remove("--html-only")
@@ -217,12 +339,25 @@ def main():
         eml_path = sys.argv[1]
         if not os.path.exists(eml_path):
             sys.exit(1)
-        _, html = parse_eml(eml_path)
+        _, html, _ = parse_eml(eml_path, anchor)
         sys.stdout.write(html)
         return
 
+    # --list prints the chain so a link can be built without opening a window.
+    if "--list" in sys.argv:
+        sys.argv.remove("--list")
+        if len(sys.argv) < 2 or not os.path.exists(sys.argv[1]):
+            sys.exit(1)
+        for seg in chain_of(sys.argv[1]):
+            print("%s\t%s\t%s" % (
+                seg["key"],
+                seg["from"] or ("(this message)" if seg["index"] == 0 else "?"),
+                seg["sent"],
+            ))
+        return
+
     if len(sys.argv) < 2:
-        print("Usage: eml_viewer.py <file.eml>")
+        print("Usage: eml_viewer.py [--anchor KEY] [--list] <file.eml>")
         sys.exit(1)
 
     eml_path = sys.argv[1]
@@ -231,9 +366,9 @@ def main():
         sys.exit(1)
 
     if HAS_WEBKIT and sys.platform == "darwin":
-        show_native(eml_path)
+        show_native(eml_path, anchor)
     else:
-        show_browser(eml_path)
+        show_browser(eml_path, anchor)
 
 
 if __name__ == "__main__":
