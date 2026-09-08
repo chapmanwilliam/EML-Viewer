@@ -12,8 +12,18 @@ set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 APP="${1:-$HOME/Applications/EML Viewer.app}"
 
+# Built universal so one bundle runs on both the Apple Silicon machine and the
+# Intel one at work. swiftc only emits the host arch, so each slice is compiled
+# on its own and lipo'd together; the deployment target matches Info.plist.
 echo "building..."
-swiftc -O -o "$SRC/EMLViewerBin" "$SRC/EMLViewer.swift" -framework Cocoa -framework WebKit
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+for ARCH in arm64 x86_64; do
+    echo "  $ARCH"
+    swiftc -O -target "$ARCH-apple-macos12.0" -o "$TMP/$ARCH" \
+        "$SRC/EMLViewer.swift" -framework Cocoa -framework WebKit
+done
+lipo -create -output "$SRC/EMLViewerBin" "$TMP/arm64" "$TMP/x86_64"
 
 echo "assembling $APP"
 rm -rf "$APP"

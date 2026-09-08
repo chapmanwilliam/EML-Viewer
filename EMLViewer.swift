@@ -143,6 +143,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, NSWind
     }
 
     func handle(_ url: URL) {
+        // A double-clicked .eml arrives here too, as a file URL: implementing
+        // application(_:open:) at all takes application(_:openFile:) out of use,
+        // so without this branch Launch Services opens the app and no window.
+        if url.isFileURL {
+            openFile(url.path)
+            return
+        }
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
         var file: String? = nil
         var msg: String? = nil
